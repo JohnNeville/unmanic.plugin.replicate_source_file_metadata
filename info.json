@@ -1,12 +1,12 @@
 {
-    "author": "Josh.5",
+    "author": "JohnNeville",
     "compatibility": [
         2
     ],
-    "description": "Fetch the stats from the original source file and apply them to all destination files once all final file movements have been completed.",
-    "icon": "https://raw.githubusercontent.com/Josh5/unmanic.plugin.replicate_source_file_stats/master/icon.png",
-    "id": "replicate_source_file_stats",
-    "name": "Replicate all source file stats",
+    "description": "Fetch the creation date from the original source file and apply them to all destination files once all final file movements have been completed.",
+    "icon": "https://github.com/JohnNeville/unmanic.plugin.replicate_source_file_metadata/master/icon.png",
+    "id": "replicate_source_file_metadata",
+    "name": "Replicate all source file MetaData",
     "priorities": {
         "on_postprocessor_file_movement": 0,
         "on_postprocessor_task_results": 99

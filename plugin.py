@@ -21,52 +21,72 @@
         If not, see <https://www.gnu.org/licenses/>.
 
 """
-import hashlib
 import json
 import logging
 import os
-import stat
+import shutil
+import subprocess
+import tempfile
 
 from unmanic.libs.unplugins.settings import PluginSettings
 
 # Configure plugin logger
-logger = logging.getLogger("Unmanic.Plugin.replicate_source_file_stats")
+logger = logging.getLogger("Unmanic.Plugin.replicate_source_file_metadata")
 
 
 class Settings(PluginSettings):
     settings = {
-        "update_mode":   True,
-        "update_access": True,
-        "update_modify": True,
+        "replicate_creation_time": True,
     }
 
     def __init__(self, *args, **kwargs):
         super(Settings, self).__init__(*args, **kwargs)
         self.form_settings = {
-            "update_mode":   {
-                "label": "Update the destination file's mode to match that of the original source file",
-            },
-            "update_access": {
-                "label": "Update the destination file's last access time (atime) to match that of the original source file",
-            },
-            "update_modify": {
-                "label": "Update the destination file's last modified time (mtime) to match that of the original source file",
+            "replicate_creation_time": {
+                "label": "Replicate the source file's 'creation_time' metadata to the destination file.",
+                "field_type": "boolean",
+                "value": True,
             },
         }
 
 
-def get_file_stat(settings, path_to_file):
-    """Return the file stat based on plugin config"""
+def get_file_metadata(path_to_file):
+    """Return the file metadata based on plugin config"""
     return_data = {}
-    st = os.stat(path_to_file)
-    if settings.get_setting('update_mode'):
-        return_data['mode'] = int(st.st_mode)
+    try:
+        process = subprocess.Popen(
+            [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                path_to_file
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding='utf-8'
+        )
+        stdout, stderr = process.communicate()
+        if stderr:
+            logger.error("Failed to read metadata from file '{}' - {}".format(path_to_file, stderr))
+            return return_data
 
-    if settings.get_setting('update_access'):
-        return_data['access'] = int(st.st_atime)
+        probe_data = json.loads(stdout)
+        
+        # Get creation_time from format tags
+        if 'format' in probe_data and 'tags' in probe_data['format'] and 'creation_time' in probe_data['format']['tags']:
+            return_data['creation_time'] = probe_data['format']['tags']['creation_time']
+            return return_data
 
-    if settings.get_setting('update_modify'):
-        return_data['modify'] = int(st.st_mtime)
+        # If not in format, check streams
+        for stream in probe_data.get('streams', []):
+            if 'tags' in stream and 'creation_time' in stream['tags']:
+                return_data['creation_time'] = stream['tags']['creation_time']
+                return return_data
+                
+    except Exception as e:
+        logger.error("Exception while reading metadata from file '{}' - {}".format(path_to_file, e))
 
     return return_data
 
@@ -90,8 +110,10 @@ def on_postprocessor_file_movement(data):
     :return:
 
     """
-    # Configure settings object (maintain compatibility with v1 plugins)
+    # Configure settings object
     settings = Settings(library_id=data.get('library_id'))
+    if not settings.get_setting('replicate_creation_time'):
+        return
 
     # Get the original file's absolute path
     original_source_path = data.get('source_data', {}).get('abspath')
@@ -103,12 +125,10 @@ def on_postprocessor_file_movement(data):
     cache_directory = os.path.dirname(data.get('file_in'))
     if not os.path.exists(cache_directory):
         os.makedirs(cache_directory)
-    src_file_hash = hashlib.md5(original_source_path.encode('utf8')).hexdigest()
-    plugin_data_file = os.path.join(cache_directory, '{}.json'.format(src_file_hash))
+    
+    plugin_data_file = os.path.join(cache_directory, 'replicate_metadata.json')
     with open(plugin_data_file, 'w') as f:
-        required_data = {
-            'stat': get_file_stat(settings, original_source_path),
-        }
+        required_data = get_file_metadata(original_source_path)
         json.dump(required_data, f, indent=4)
 
 
@@ -129,51 +149,80 @@ def on_postprocessor_task_results(data):
     
     """
     settings = Settings(library_id=data.get('library_id'))
-
-    # Get the original file's absolute path
-    original_source_path = data.get('source_data', {}).get('abspath')
-    if not original_source_path:
-        logger.error("Provided 'source_data' is missing the source file abspath data.")
+    if not settings.get_setting('replicate_creation_time'):
         return
 
     # Read the original file's data
     cache_directory = os.path.dirname(data.get('final_cache_path'))
-    src_file_hash = hashlib.md5(original_source_path.encode('utf8')).hexdigest()
-    plugin_data_file = os.path.join(cache_directory, '{}.json'.format(src_file_hash))
+    plugin_data_file = os.path.join(cache_directory, 'replicate_metadata.json')
     if not os.path.exists(plugin_data_file):
-        logger.error("Plugin data file is missing (This may be because the file movement post-processor was skipped)")
-        raise Exception("Plugin data file is missing.")
+        logger.warning("Plugin data file is missing. Skipping metadata replication.")
+        return
+    
     with open(plugin_data_file) as infile:
         source_file_data = json.load(infile)
 
+    creation_time = source_file_data.get('creation_time')
+    if not creation_time:
+        logger.info("No creation_time metadata found in source file. Skipping.")
+        return
+
     for destination_file in data.get('destination_files'):
-        # Update the destination file's stats
         if not os.path.exists(destination_file):
             logger.error("Unable to find destination file '{}'".format(destination_file))
             continue
 
-        # Update files mode
-        if settings.get_setting('update_mode') and source_file_data.get('stat', {}).get('mode'):
-            mode = stat.S_IMODE(int(source_file_data.get('stat', {}).get('mode')))
-            try:
-                os.chmod(destination_file, mode)
-                logger.debug("Set the mode of destination file '{}'".format(destination_file))
-            except NotImplementedError:
-                logger.error("Unable to update the mode of destination file '{}'".format(destination_file))
+        try:
+            # Use a temporary file in the same directory as the destination
+            temp_output_file = tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix='.mp4',
+                dir=os.path.dirname(destination_file)
+            ).name
 
-        # Default to file's current times
-        st = os.stat(destination_file)
-        atime = st.st_atime
-        mtime = st.st_mtime
-        update = False
-        if settings.get_setting('update_access') and source_file_data.get('stat', {}).get('access'):
-            atime = int(source_file_data.get('stat', {}).get('access'))
-            update = True
-        if settings.get_setting('update_modify') and source_file_data.get('stat', {}).get('modify'):
-            mtime = int(source_file_data.get('stat', {}).get('modify'))
-            update = True
-        if update:
-            os.utime(destination_file, (atime, mtime))
-            logger.debug("Set atime/mtime the of destination file '{}'".format(destination_file))
+            ffmpeg_command = [
+                'ffmpeg',
+                '-i', destination_file,
+                '-c', 'copy',
+                '-metadata', 'creation_time={}'.format(creation_time),
+                '-metadata:s:v:0', 'creation_time={}'.format(creation_time),
+                '-metadata:s:a:0', 'creation_time={}'.format(creation_time),
+                '-y',  # Overwrite temp file if it exists
+                temp_output_file
+            ]
+
+            logger.info("Running ffmpeg to update metadata: {}".format(" ".join(ffmpeg_command)))
+
+            process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            stdout, stderr = process.communicate()
+
+            if process.returncode != 0:
+                logger.error("Failed to update metadata for '{}'".format(destination_file))
+                logger.error(stderr)
+                if os.path.exists(temp_output_file):
+                    os.remove(temp_output_file)
+                continue
+
+            # Safety check: ensure the temp file is not empty
+            if os.path.getsize(temp_output_file) == 0:
+                logger.error("ffmpeg created an empty file. Aborting to prevent data loss.")
+                os.remove(temp_output_file)
+                continue
+
+            # Replace the original file with the one with updated metadata
+            os.rename(temp_output_file, destination_file)
+            logger.info("Successfully updated creation_time for '{}'".format(destination_file))
+
+        except Exception as e:
+            logger.error("Exception while updating metadata for file '{}' - {}".format(destination_file, e))
+            if 'temp_output_file' in locals() and os.path.exists(temp_output_file):
+                try:
+                    os.remove(temp_output_file)
+                except OSError as ose:
+                    logger.error(f"Error removing temporary file {temp_output_file}: {ose}")
+
+    # Clean up the plugin data file
+    if os.path.exists(plugin_data_file):
+        os.remove(plugin_data_file)
 
     return
